@@ -8,16 +8,38 @@
 #include <cstdlib>
 #include <vector>
 
+#define CUDA_CHECK(call)                                                        \
+    do {                                                                        \
+        cudaError_t err__ = (call);                                             \
+        if (err__ != cudaSuccess) {                                             \
+            std::fprintf(stderr, "CUDA error '%s' at %s:%d\n",                  \
+                         cudaGetErrorString(err__), __FILE__, __LINE__);        \
+            std::exit(EXIT_FAILURE);                                            \
+        }                                                                       \
+    } while (0)
+
+#define CUBLAS_CHECK(call)                                                      \
+    do {                                                                        \
+        cublasStatus_t st__ = (call);                                           \
+        if (st__ != CUBLAS_STATUS_SUCCESS) {                                    \
+            std::fprintf(stderr, "cuBLAS error %d at %s:%d\n", (int)st__,       \
+                         __FILE__, __LINE__);                                   \
+            std::exit(EXIT_FAILURE);                                            \
+        }                                                                       \
+    } while (0)
+
 ////////////////////////////////////////////////////////////////////////////////
 // Custom rank-1 update kernel
 // A <- A + alpha * x * y^T
 // Column-major storage: A(i,j) = A[j*m + i]
+// threadIdx.x runs along i (rows) => consecutive threads touch consecutive
+// addresses of A and x => coalesced accesses.
 __global__ void ger_kernel(int m, int n, float alpha, const float* x, const float* y, float* A)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
-    if (i<m && j<n){
-      A[(size_t)j*m+i] += alpha*x[i]*y[j];
+    if (i < m && j < n) {
+        A[(size_t)j * m + i] += alpha * x[i] * y[j];
     }
 }
 
@@ -33,23 +55,23 @@ void ger_cpu(int m, int n, float alpha, const float* x, const float* y, float* A
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// compute error norm
-double compute_error_norm(int size,
+// relative error norm ||result - reference||_2 / ||reference||_2
+double compute_error_norm(size_t size,
                           const float* result,
                           const float* reference)
 {
     double error = 0.0;
     double norm  = 0.0;
 
-    for (int i = 0; i < size; ++i) {
-        const double diff  = std::fabs((double)result[i] - (double)reference[i]);
-        const double denom = std::fabs((double)reference[i]);
+    for (size_t i = 0; i < size; ++i) {
+        const double diff  = (double)result[i] - (double)reference[i];
+        const double denom = (double)reference[i];
 
         error += diff * diff;
         norm  += denom * denom;
     }
 
-    return sqrt(error) / sqrt(norm);
+    return std::sqrt(error) / std::sqrt(norm);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -97,85 +119,91 @@ int main(int argc, char** argv)
     // --------------------------------------------------------
     float *d_x = nullptr, *d_y = nullptr, *d_A = nullptr;
 
-    cudaMalloc(&d_x, (size_t)m * sizeof(float));
-    cudaMalloc(&d_y, (size_t)n * sizeof(float));
-    cudaMalloc(&d_A, matrix_bytes);
+    CUDA_CHECK(cudaMalloc(&d_x, (size_t)m * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_y, (size_t)n * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_A, matrix_bytes));
 
     // copy input vectors from CPU -> GPU
-    cudaMemcpy(d_x, h_x.data(), (size_t)m * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_y, h_y.data(), (size_t)n * sizeof(float), cudaMemcpyHostToDevice);
+    CUDA_CHECK(cudaMemcpy(d_x, h_x.data(), (size_t)m * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_y, h_y.data(), (size_t)n * sizeof(float), cudaMemcpyHostToDevice));
 
     std::printf("Matrix: %d x %d, alpha = %.2f, repeats = %d\n",
                 m, n, alpha, repeats);
     std::printf("Matrix storage: column-major\n\n");
 
-    // n1000: configure your kernel here
-    // TODO: the configuration below is a default that you must change
-    dim3 block(32, 8, 1);
-    dim3 grid((m + block.x - 1)/block.x, (n + block.y - 1)/block.y, 1);
-    // end of TODO: kernel configuration
+    // --------------------------------------------------------
+    // Kernel configuration
+    // --------------------------------------------------------
+    // x is the fast (row) dimension of the column-major matrix, so the block is
+    // wide in x for coalescing: a warp covers 32 consecutive rows of one column.
+    // 64 x 4 = 256 threads per block. Other shapes worth benchmarking:
+    // (32,8), (128,2), (256,1). Keep the product a multiple of 32 and <= 1024.
+    dim3 block(64, 4, 1);
+    dim3 grid((m + block.x - 1) / block.x, (n + block.y - 1) / block.y, 1);
 
     cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
 
     // --------------------------------------------------------
     // Custom kernel: warm-up and timing
     // --------------------------------------------------------
-    cudaMemcpy(d_A, h_A0.data(), matrix_bytes, cudaMemcpyHostToDevice);
+    CUDA_CHECK(cudaMemcpy(d_A, h_A0.data(), matrix_bytes, cudaMemcpyHostToDevice));
 
     ger_kernel<<<grid, block>>>(m, n, alpha, d_x, d_y, d_A);
-    cudaDeviceSynchronize();
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
 
     // Restore the initial matrix before the timed repetitions.
-    cudaMemcpy(d_A, h_A0.data(), matrix_bytes,
-               cudaMemcpyHostToDevice);
+    CUDA_CHECK(cudaMemcpy(d_A, h_A0.data(), matrix_bytes, cudaMemcpyHostToDevice));
 
-    cudaEventRecord(start);
+    CUDA_CHECK(cudaEventRecord(start));
     for (int r = 0; r < repeats; ++r) {
         ger_kernel<<<grid, block>>>(m, n, alpha, d_x, d_y, d_A);
     }
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaEventRecord(stop));
+    CUDA_CHECK(cudaEventSynchronize(stop));
 
     float custom_ms = 0.0f;
-    cudaEventElapsedTime(&custom_ms, start, stop);
+    CUDA_CHECK(cudaEventElapsedTime(&custom_ms, start, stop));
     const double custom_us = custom_ms * 1000.0 / repeats;
 
     // Correctness run: restore initial A and update once.
-    cudaMemcpy(d_A, h_A0.data(), matrix_bytes, cudaMemcpyHostToDevice);
+    CUDA_CHECK(cudaMemcpy(d_A, h_A0.data(), matrix_bytes, cudaMemcpyHostToDevice));
     ger_kernel<<<grid, block>>>(m, n, alpha, d_x, d_y, d_A);
-    cudaMemcpy(h_custom.data(), d_A, matrix_bytes, cudaMemcpyDeviceToHost);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaMemcpy(h_custom.data(), d_A, matrix_bytes, cudaMemcpyDeviceToHost));
 
     // --------------------------------------------------------
     // cuBLAS SGER: warm-up and timing
     // --------------------------------------------------------
     cublasHandle_t handle;
-    cublasCreate(&handle);
+    CUBLAS_CHECK(cublasCreate(&handle));
 
-    cudaMemcpy(d_A, h_A0.data(), matrix_bytes, cudaMemcpyHostToDevice);
+    CUDA_CHECK(cudaMemcpy(d_A, h_A0.data(), matrix_bytes, cudaMemcpyHostToDevice));
 
-    cublasSger(handle, m, n, &alpha, d_x, 1, d_y, 1, d_A, m);
-    cudaDeviceSynchronize();
+    CUBLAS_CHECK(cublasSger(handle, m, n, &alpha, d_x, 1, d_y, 1, d_A, m));
+    CUDA_CHECK(cudaDeviceSynchronize());
 
     // Restore the initial matrix before the timed repetitions.
-    cudaMemcpy(d_A, h_A0.data(), matrix_bytes, cudaMemcpyHostToDevice);
+    CUDA_CHECK(cudaMemcpy(d_A, h_A0.data(), matrix_bytes, cudaMemcpyHostToDevice));
 
-    cudaEventRecord(start);
+    CUDA_CHECK(cudaEventRecord(start));
     for (int r = 0; r < repeats; ++r) {
-        cublasSger(handle, m, n, &alpha, d_x, 1, d_y, 1, d_A, m);
+        CUBLAS_CHECK(cublasSger(handle, m, n, &alpha, d_x, 1, d_y, 1, d_A, m));
     }
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
+    CUDA_CHECK(cudaEventRecord(stop));
+    CUDA_CHECK(cudaEventSynchronize(stop));
 
     float cublas_ms = 0.0f;
-    cudaEventElapsedTime(&cublas_ms, start, stop);
+    CUDA_CHECK(cudaEventElapsedTime(&cublas_ms, start, stop));
     const double cublas_us = cublas_ms * 1000.0 / repeats;
 
     // Correctness run: restore initial A and update once.
-    cudaMemcpy(d_A, h_A0.data(), matrix_bytes, cudaMemcpyHostToDevice);
-    cublasSger(handle, m, n, &alpha, d_x, 1, d_y, 1, d_A, m);
-    cudaMemcpy(h_cublas.data(), d_A, matrix_bytes, cudaMemcpyDeviceToHost);
+    CUDA_CHECK(cudaMemcpy(d_A, h_A0.data(), matrix_bytes, cudaMemcpyHostToDevice));
+    CUBLAS_CHECK(cublasSger(handle, m, n, &alpha, d_x, 1, d_y, 1, d_A, m));
+    CUDA_CHECK(cudaMemcpy(h_cublas.data(), d_A, matrix_bytes, cudaMemcpyDeviceToHost));
 
     // --------------------------------------------------------
     // Performance and error norm
@@ -186,8 +214,8 @@ int main(int argc, char** argv)
     const double custom_gflops = flops / (custom_us * 1.0e3);
     const double cublas_gflops = flops / (cublas_us * 1.0e3);
 
-    const double custom_error = compute_error_norm( (int)matrix_size, h_custom.data(), h_ref.data());
-    const double cublas_error = compute_error_norm( (int)matrix_size, h_cublas.data(), h_ref.data());
+    const double custom_error = compute_error_norm(matrix_size, h_custom.data(), h_ref.data());
+    const double cublas_error = compute_error_norm(matrix_size, h_cublas.data(), h_ref.data());
 
     std::printf("%-20s %12s %12s %20s\n",
                 "Implementation", "Time (us)", "GFLOP/s",
@@ -202,7 +230,7 @@ int main(int argc, char** argv)
                 cublas_error);
 
     const double tol = 1e-6;
-    if( double(custom_error) <= tol ) {
+    if (custom_error <= tol) {
         std::printf("\nTEST PASS\n");
         std::printf("Speedup (cuBLAS time / custom time): %.3fx\n", cublas_us / custom_us);
     }
@@ -214,12 +242,12 @@ int main(int argc, char** argv)
     // --------------------------------------------------------
     // Cleanup
     // --------------------------------------------------------
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
-    cublasDestroy(handle);
-    cudaFree(d_x);
-    cudaFree(d_y);
-    cudaFree(d_A);
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    CUBLAS_CHECK(cublasDestroy(handle));
+    CUDA_CHECK(cudaFree(d_x));
+    CUDA_CHECK(cudaFree(d_y));
+    CUDA_CHECK(cudaFree(d_A));
 
     return 0;
 }
